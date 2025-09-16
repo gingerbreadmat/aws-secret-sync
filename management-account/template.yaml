@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Deploys the AWS Secret Sync solution in a management account.
+  This includes the core Lambda function, its execution role, and a scheduled trigger.
+
+Globals:
+  Function:
+    Timeout: 60
+
+Resources:
+  SecretSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt SecretSyncLambdaRole.Arn
+
+  SecretSyncLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SecretSyncLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+        - PolicyName: SecretAndTagAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:ListSecrets
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - tag:GetResources
+                Resource: "*"
+        - PolicyName: AssumeSyncRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: "arn:aws:iam::*:role/SecretSyncRole"
+
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Scheduled trigger for Secret Sync Lambda"
+      ScheduleExpression: "rate(1 hour)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt SecretSyncFunction.Arn
+          Id: "SecretSyncFunctionTarget"
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SecretSyncFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: "Name of the Secret Sync Lambda function"
+    Value: !Ref SecretSyncFunction

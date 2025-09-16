@@ -1,0 +1,6 @@
+version = 0.1
+[default.deploy.parameters]
+stack_name = "Secret-Sync"
+resolve_s3 = true
+capabilities = "CAPABILITY_NAMED_IAM"
+
