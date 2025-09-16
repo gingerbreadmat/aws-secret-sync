@@ -90,6 +90,8 @@ Resources:
                   - "secretsmanager:UpdateSecret"
                   - "secretsmanager:PutSecretValue"
                   - "secretsmanager:DescribeSecret"
+                  - "secretsmanager:TagResource"
+                  - "secretsmanager:DeleteSecret"
                 Resource: "*"
 ```
 
@@ -135,7 +137,9 @@ resource "aws_iam_role_policy" "secret_write_access" {
           "secretsmanager:CreateSecret",
           "secretsmanager:UpdateSecret",
           "secretsmanager:PutSecretValue",
-          "secretsmanager:DescribeSecret"
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:TagResource",
+          "secretsmanager:DeleteSecret"
         ],
         Resource = "*"
       }
@@ -148,9 +152,11 @@ resource "aws_iam_role_policy" "secret_write_access" {
 
 ## Day-to-Day Usage
 
-Tagging a secret in the management account is how you control where it gets synced. The logic is determined by a combination of four possible tags.
+Tagging a secret in the management account is how you control where it gets synced and deleted. The logic is determined by a combination of six possible tags.
 
 ### Tagging Rules
+
+#### Sync Operations
 
 1.  **Build a "Sync" list:**
     *   `SecretSync-SyncDestinationGroup`: Syncs the secret to all accounts in this group from your config file.
@@ -163,6 +169,17 @@ Tagging a secret in the management account is how you control where it gets sync
 3.  **Final Logic:** The final list of accounts to sync to is (`Sync` list) - (`NoSync` list).
     *   **Exclusion takes priority.** If an account is in both lists, it will be excluded.
     *   The `...Account` tags only support a single account ID. To specify multiple accounts, you must create a group in the `secret-sync/config` file.
+
+#### Delete Operations
+
+1.  **Delete Tags:**
+    *   `SecretSync-DeleteDestinationGroup`: Deletes the secret from all accounts in this group.
+    *   `SecretSync-DeleteAccount`: Deletes the secret from the single account ID specified.
+
+2.  **Safety Features:**
+    *   Only deletes secrets that have a `SyncedFrom` tag matching the management account ID.
+    *   Will skip deletion if the secret was not originally synced by this tool.
+    *   Uses immediate deletion (`ForceDeleteWithoutRecovery=True`) without recovery period.
 
 ### Example Scenarios
 
@@ -188,9 +205,30 @@ To sync a secret to the `Development` group and also to a special `Staging` acco
     *   Key: `SecretSync-SyncAccount`
     *   Value: `987654321098`
 
-### Triggering the Sync
+#### Delete from Specific Account
 
-After tagging a secret, the Lambda will process it on its next scheduled run (e.g., once per hour). You can also trigger the Lambda manually in the AWS Console for an immediate sync.
+To delete a secret from a single account (`111111111111`):
+
+*   **Tag:**
+    *   Key: `SecretSync-DeleteAccount`
+    *   Value: `111111111111`
+
+#### Delete from Group
+
+To delete a secret from all accounts in the `Development` group:
+
+*   **Tag:**
+    *   Key: `SecretSync-DeleteDestinationGroup`
+    *   Value: `Development`
+
+### Triggering Operations
+
+After tagging a secret with sync or delete tags, the Lambda will process it on its next scheduled run (e.g., once per hour). You can also trigger the Lambda manually in the AWS Console for immediate processing.
+
+**Important Notes:**
+- A secret can have both sync and delete tags - both operations will be processed during the same run.
+- Delete operations include safety checks to ensure only secrets managed by this tool are deleted.
+- All synced secrets are automatically tagged with `SyncedFrom: {ManagementAccountId}` for tracking.
 
 ---
 
