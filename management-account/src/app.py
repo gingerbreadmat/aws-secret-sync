@@ -1,3 +1,4 @@
+
 import json
 import boto3
 import os
@@ -31,11 +32,7 @@ def get_config():
         raise
 
 def get_secrets_to_process():
-    """
-    Finds all secrets that have at least one of our sync tags.
-    The get_resources API doesn't support OR on tags, so we must fetch all
-    secrets and filter them in the code.
-    """
+    """Finds all secrets that have at least one of our sync tags."""
     print("Searching for all secrets to find resources to process...")
     paginator = tagging.get_paginator("get_resources")
     pages = paginator.paginate(ResourceTypeFilters=["secretsmanager:secret"])
@@ -43,40 +40,51 @@ def get_secrets_to_process():
     secrets_to_process = []
     for page in pages:
         for resource in page.get("ResourceTagMappingList", []):
-            # Check if any of the resource's tags match our sync tag keys
             if any(tag['Key'] in SYNC_TAG_KEYS for tag in resource.get("Tags", [])):
                 secrets_to_process.append(resource)
             
     print(f"Found {len(secrets_to_process)} secrets with sync-related tags.")
     return secrets_to_process
 
-def calculate_target_accounts(tags, config):
+def resolve_sync_targets(tags, config):
     """
-    Calculates the final set of target accounts based on the logic:
-    (Sync Groups + Sync Accounts) - (NoSync Groups + NoSync Accounts)
+    Calculates the final list of (account_id, region) targets.
     """
-    sync_set = set()
+    sync_targets = {}  # Using a dict to ensure one entry per account, mapping account_id -> region
     exclude_set = set()
     account_groups = config.get("AccountGroups", {})
 
+    # Inclusion Pass
     for tag in tags:
-        key = tag.get("Key")
-        value = tag.get("Value")
-
+        key, value = tag.get("Key"), tag.get("Value")
         if key == TAG_SYNC_GROUP:
-            sync_set.update(account_groups.get(value, []))
+            group_info = account_groups.get(value, {})
+            # Handle both old format (list) and new format (dict)
+            accounts = group_info if isinstance(group_info, list) else group_info.get("Accounts", [])
+            region = group_info.get("Region") if isinstance(group_info, dict) else None
+            for account in accounts:
+                sync_targets[account] = region
         elif key == TAG_SYNC_ACCOUNT:
-            sync_set.add(value)
-        elif key == TAG_NO_SYNC_GROUP:
-            exclude_set.update(account_groups.get(value, []))
+            sync_targets[value] = None # Individual accounts sync to the Lambda's region
+
+    # Exclusion Pass
+    for tag in tags:
+        key, value = tag.get("Key"), tag.get("Value")
+        if key == TAG_NO_SYNC_GROUP:
+            group_info = account_groups.get(value, {})
+            accounts = group_info if isinstance(group_info, list) else group_info.get("Accounts", [])
+            exclude_set.update(accounts)
         elif key == TAG_NO_SYNC_ACCOUNT:
             exclude_set.add(value)
-            
-    return sync_set - exclude_set
 
-def sync_to_single_account(account_id, secret_name, secret_value):
-    """Assumes a role in a target account and creates/updates the secret."""
-    print(f"  -> Syncing to account {account_id} as secret '{secret_name}'...")
+    # Final Calculation
+    final_targets = {acc: region for acc, region in sync_targets.items() if acc not in exclude_set}
+    return list(final_targets.items())
+
+def sync_to_single_account(account_id, region, secret_name, secret_value):
+    """Assumes a role in a target account and creates/updates the secret in the specified region."""
+    region_str = region if region else "the default region"
+    print(f"  -> Syncing to account {account_id} in {region_str} as secret '{secret_name}'...")
     try:
         assumed_role = sts.assume_role(
             RoleArn=f"arn:aws:iam::{account_id}:role/{ROLE_TO_ASSUME}",
@@ -86,6 +94,7 @@ def sync_to_single_account(account_id, secret_name, secret_value):
         
         target_sm_client = boto3.client(
             "secretsmanager",
+            region_name=region,
             aws_access_key_id=credentials["AccessKeyId"],
             aws_secret_access_key=credentials["SecretAccessKey"],
             aws_session_token=credentials["SessionToken"],
@@ -102,7 +111,7 @@ def sync_to_single_account(account_id, secret_name, secret_value):
             print(f"     Successfully created secret '{secret_name}' in account {account_id}.")
 
     except Exception as e:
-        print(f"     ERROR: Failed to sync to account {account_id}. Error: {e}")
+        print(f"     ERROR: Failed to sync to account {account_id} in region {region}. Error: {e}")
 
 def lambda_handler(event, context):
     """Main function for the Lambda."""
@@ -114,24 +123,21 @@ def lambda_handler(event, context):
         tags = resource.get("Tags", [])
         
         try:
-            # Determine the final list of accounts to sync to
-            final_accounts = calculate_target_accounts(tags, config)
+            final_targets = resolve_sync_targets(tags, config)
 
-            if not final_accounts:
-                print(f"Skipping secret {secret_arn}: no target accounts after calculating exclusions.")
+            if not final_targets:
+                print(f"Skipping secret {secret_arn}: no target accounts after calculating rules.")
                 continue
 
-            print(f"Processing secret {secret_arn} for {len(final_accounts)} target account(s).")
+            print(f"Processing secret {secret_arn} for {len(final_targets)} target(s).")
 
-            # Get the secret's name and value
             describe_response = secretsmanager.describe_secret(SecretId=secret_arn)
             secret_name = describe_response["Name"]
             secret_response = secretsmanager.get_secret_value(SecretId=secret_arn)
             secret_value = secret_response["SecretString"]
             
-            # Sync to each final account
-            for account_id in final_accounts:
-                sync_to_single_account(account_id, secret_name, secret_value)
+            for account_id, region in final_targets:
+                sync_to_single_account(account_id, region, secret_name, secret_value)
 
         except Exception as e:
             print(f"ERROR: Could not process secret {secret_arn}. Error: {e}")
