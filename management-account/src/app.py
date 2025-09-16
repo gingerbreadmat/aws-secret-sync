@@ -25,15 +25,25 @@ TAG_DELETE_ACCOUNT = "SecretSync-DeleteAccount"
 
 SYNC_TAG_KEYS = [TAG_SYNC_GROUP, TAG_SYNC_ACCOUNT, TAG_NO_SYNC_GROUP, TAG_NO_SYNC_ACCOUNT, TAG_DELETE_GROUP, TAG_DELETE_ACCOUNT]
 
-def get_config():
+def get_config(required=True):
     """Retrieves and parses the configuration from Secrets Manager."""
     try:
         response = secretsmanager.get_secret_value(SecretId=CONFIG_SECRET_ID)
         config = json.loads(response["SecretString"])
         print("Successfully loaded configuration.")
         return config
+    except secretsmanager.exceptions.ResourceNotFoundException:
+        if required:
+            print(f"FATAL: Configuration secret {CONFIG_SECRET_ID} not found. This is required when using group-based tags.")
+            raise
+        else:
+            print(f"Configuration secret {CONFIG_SECRET_ID} not found. Using individual account tags only.")
+            return None
+    except json.JSONDecodeError as e:
+        print(f"FATAL: Could not parse configuration secret {CONFIG_SECRET_ID} as JSON. Error: {e}")
+        raise
     except Exception as e:
-        print(f"FATAL: Could not retrieve or parse configuration secret {CONFIG_SECRET_ID}. Error: {e}")
+        print(f"FATAL: Could not retrieve configuration secret {CONFIG_SECRET_ID}. Error: {e}")
         raise
 
 def get_secrets_to_process():
@@ -57,7 +67,12 @@ def resolve_sync_targets(tags, config):
     """
     sync_targets = {}  # Using a dict to ensure one entry per account, mapping account_id -> region
     exclude_set = set()
-    account_groups = config.get("AccountGroups", {})
+    account_groups = config.get("AccountGroups", {}) if config else {}
+
+    # Check for group-based tags when config is missing
+    group_tags = [tag for tag in tags if tag.get("Key") in [TAG_SYNC_GROUP, TAG_NO_SYNC_GROUP]]
+    if group_tags and not config:
+        raise ValueError(f"Configuration secret {CONFIG_SECRET_ID} is required when using group-based tags: {[tag.get('Key') for tag in group_tags]}")
 
     # Inclusion Pass
     for tag in tags:
@@ -197,8 +212,20 @@ def delete_from_single_account(account_id, region, secret_name):
 
 def lambda_handler(event, context):
     """Main function for the Lambda."""
-    config = get_config()
     secrets_to_process = get_secrets_to_process()
+    
+    # Check if any secrets use group-based tags
+    group_based_tags = [TAG_SYNC_GROUP, TAG_NO_SYNC_GROUP]
+    config_required = False
+    
+    for resource in secrets_to_process:
+        tags = resource.get("Tags", [])
+        if any(tag.get("Key") in group_based_tags for tag in tags):
+            config_required = True
+            break
+    
+    # Only load config if needed
+    config = get_config(required=config_required)
 
     for resource in secrets_to_process:
         secret_arn = resource["ResourceARN"]
