@@ -60,11 +60,13 @@ def get_secrets_to_process():
 
 def resolve_sync_targets(tags, config):
     """
-    Calculates the final list of (account_id, region) targets.
+    Calculates the final list of (account_id, region, delete_sync) targets.
     """
-    sync_targets = {}  # Using a dict to ensure one entry per account, mapping account_id -> region
+    sync_targets = {}  # Using a dict to ensure one entry per account, mapping account_id -> (region, delete_sync)
     exclude_set = set()
     account_groups = config.get("AccountGroups", {}) if config else {}
+    global_delete_sync = config.get("DeleteSync", True) if config else True
+    never_delete = config.get("NeverDelete", False) if config else False
 
     # Check for group-based tags when config is missing
     group_tags = [tag for tag in tags if tag.get("Key") in [TAG_SYNC_GROUP, TAG_NO_SYNC_GROUP]]
@@ -79,10 +81,11 @@ def resolve_sync_targets(tags, config):
             # Handle both old format (list) and new format (dict)
             accounts = group_info if isinstance(group_info, list) else group_info.get("Accounts", [])
             region = group_info.get("Region") if isinstance(group_info, dict) else None
+            delete_sync = group_info.get("DeleteSync", global_delete_sync) if isinstance(group_info, dict) else global_delete_sync
             for account in accounts:
-                sync_targets[account] = region
+                sync_targets[account] = (region, delete_sync)
         elif key == TAG_SYNC_ACCOUNT:
-            sync_targets[value] = None # Individual accounts sync to the Lambda's region
+            sync_targets[value] = (None, global_delete_sync) # Individual accounts use global setting
 
     # Exclusion Pass
     for tag in tags:
@@ -95,11 +98,11 @@ def resolve_sync_targets(tags, config):
             exclude_set.add(value)
 
     # Final Calculation
-    final_targets = {acc: region for acc, region in sync_targets.items() if acc not in exclude_set}
-    return list(final_targets.items())
+    final_targets = {acc: (region, delete_sync) for acc, (region, delete_sync) in sync_targets.items() if acc not in exclude_set}
+    return [(acc, region, delete_sync) for acc, (region, delete_sync) in final_targets.items()]
 
 
-def sync_to_single_account(account_id, region, secret_name, secret_value):
+def sync_to_single_account(account_id, region, secret_name, secret_value, delete_sync=True):
     """Assumes a role in a target account and creates/updates the secret in the specified region."""
     region_str = region if region else "the default region"
     print(f"  -> Syncing to account {account_id} in {region_str} as secret '{secret_name}'...")
@@ -123,9 +126,13 @@ def sync_to_single_account(account_id, region, secret_name, secret_value):
             
             # Check if target secret is marked for deletion
             if secret_info.get("DeletedDate"):
-                print(f"     Secret '{secret_name}' is marked for deletion, restoring it first.")
-                target_sm_client.restore_secret(SecretId=secret_name)
-                print(f"     Restored secret '{secret_name}' from deletion.")
+                if delete_sync:
+                    print(f"     Secret '{secret_name}' is marked for deletion, restoring it first.")
+                    target_sm_client.restore_secret(SecretId=secret_name)
+                    print(f"     Restored secret '{secret_name}' from deletion.")
+                else:
+                    print(f"     Secret '{secret_name}' is marked for deletion, but DeleteSync is disabled. Skipping sync.")
+                    return
             
             print(f"     Secret '{secret_name}' exists. Updating value.")
             target_sm_client.put_secret_value(SecretId=secret_name, SecretString=secret_value)
@@ -148,7 +155,7 @@ def sync_to_single_account(account_id, region, secret_name, secret_value):
     except Exception as e:
         print(f"     ERROR: Failed to sync to account {account_id} in region {region}. Error: {e}")
 
-def mark_secret_for_deletion(account_id, region, secret_name, source_describe_response):
+def mark_secret_for_deletion(account_id, region, secret_name, source_describe_response, never_delete=False):
     """Mark secret for deletion in target account with same settings as source."""
     region_str = region if region else "the default region"
     print(f"  -> Marking secret '{secret_name}' for deletion in account {account_id} in {region_str}...")
@@ -171,27 +178,28 @@ def mark_secret_for_deletion(account_id, region, secret_name, source_describe_re
             # Check if target secret exists
             target_sm_client.describe_secret(SecretId=secret_name)
             
-            # Calculate recovery window from source secret
-            deletion_date = source_describe_response.get("DeletionDate")
-            deleted_date = source_describe_response.get("DeletedDate")
-            
-            if deletion_date and deleted_date:
-                # Calculate recovery window in days
-                recovery_window = (deletion_date - deleted_date).days
-                recovery_window = max(7, min(30, recovery_window))  # AWS limits: 7-30 days
-                
-                target_sm_client.delete_secret(
-                    SecretId=secret_name,
-                    RecoveryWindowInDays=recovery_window
-                )
-                print(f"     Successfully marked secret '{secret_name}' for deletion with {recovery_window} day recovery window.")
+            if never_delete:
+                # Safety mode: always use 7-day recovery window
+                recovery_window = 7
+                print(f"     NeverDelete enabled: using 7-day recovery window")
             else:
-                # Default recovery window if we can't calculate
-                target_sm_client.delete_secret(
-                    SecretId=secret_name,
-                    RecoveryWindowInDays=30
-                )
-                print(f"     Successfully marked secret '{secret_name}' for deletion with default 30 day recovery window.")
+                # Calculate recovery window from source secret
+                deletion_date = source_describe_response.get("DeletionDate")
+                deleted_date = source_describe_response.get("DeletedDate")
+                
+                if deletion_date and deleted_date:
+                    # Calculate recovery window in days
+                    recovery_window = (deletion_date - deleted_date).days
+                    recovery_window = max(7, min(30, recovery_window))  # AWS limits: 7-30 days
+                else:
+                    # Default recovery window if we can't calculate
+                    recovery_window = 30
+            
+            target_sm_client.delete_secret(
+                SecretId=secret_name,
+                RecoveryWindowInDays=recovery_window
+            )
+            print(f"     Successfully marked secret '{secret_name}' for deletion with {recovery_window} day recovery window.")
                 
         except target_sm_client.exceptions.ResourceNotFoundException:
             print(f"     Secret '{secret_name}' not found in target account, nothing to delete.")
@@ -199,7 +207,7 @@ def mark_secret_for_deletion(account_id, region, secret_name, source_describe_re
     except Exception as e:
         print(f"     ERROR: Failed to mark secret for deletion in account {account_id}: {e}")
 
-def cleanup_orphaned_secrets(account_id, managed_secrets):
+def cleanup_orphaned_secrets(account_id, managed_secrets, never_delete=False):
     """Remove secrets in target account that are no longer managed by this tool."""
     print(f"Cleaning up orphaned secrets in account {account_id}...")
     try:
@@ -229,8 +237,14 @@ def cleanup_orphaned_secrets(account_id, managed_secrets):
             if secret_name not in managed_secrets:
                 print(f"  -> Deleting orphaned secret '{secret_name}' from account {account_id}")
                 try:
-                    target_sm_client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
-                    print(f"     Successfully deleted orphaned secret '{secret_name}'")
+                    if never_delete:
+                        # Safety mode: use 7-day recovery window
+                        target_sm_client.delete_secret(SecretId=secret_name, RecoveryWindowInDays=7)
+                        print(f"     Successfully marked orphaned secret '{secret_name}' for deletion with 7-day recovery window (NeverDelete enabled)")
+                    else:
+                        # Normal mode: immediate deletion
+                        target_sm_client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+                        print(f"     Successfully deleted orphaned secret '{secret_name}'")
                 except Exception as e:
                     print(f"     ERROR: Failed to delete secret '{secret_name}': {e}")
 
@@ -257,6 +271,8 @@ def lambda_handler(event, context):
     # Track which secrets should exist in each target account
     target_accounts = set()
     managed_secrets_per_account = {}
+    delete_sync_per_account = {}
+    never_delete = config.get("NeverDelete", False) if config else False
 
     for resource in secrets_to_process:
         secret_arn = resource["ResourceARN"]
@@ -276,35 +292,43 @@ def lambda_handler(event, context):
             
             # Check if secret is marked for deletion
             if describe_response.get("DeletedDate"):
-                print(f"Secret '{secret_name}' is marked for deletion, syncing deletion state to targets.")
+                print(f"Secret '{secret_name}' is marked for deletion, syncing deletion state to targets with DeleteSync enabled.")
                 # Track managed secrets for cleanup
-                for account_id, region in sync_targets:
+                for account_id, region, delete_sync in sync_targets:
                     target_accounts.add(account_id)
+                    delete_sync_per_account[account_id] = delete_sync
                     if account_id not in managed_secrets_per_account:
                         managed_secrets_per_account[account_id] = set()
                     managed_secrets_per_account[account_id].add(secret_name)
                     
-                    mark_secret_for_deletion(account_id, region, secret_name, describe_response)
+                    if delete_sync:
+                        mark_secret_for_deletion(account_id, region, secret_name, describe_response, never_delete)
+                    else:
+                        print(f"     Skipping deletion sync for account {account_id} (DeleteSync disabled)")
             else:
                 secret_response = secretsmanager.get_secret_value(SecretId=secret_arn)
                 secret_value = secret_response["SecretString"]
                 
                 # Track managed secrets for cleanup
-                for account_id, region in sync_targets:
+                for account_id, region, delete_sync in sync_targets:
                     target_accounts.add(account_id)
+                    delete_sync_per_account[account_id] = delete_sync
                     if account_id not in managed_secrets_per_account:
                         managed_secrets_per_account[account_id] = set()
                     managed_secrets_per_account[account_id].add(secret_name)
                     
-                    sync_to_single_account(account_id, region, secret_name, secret_value)
+                    sync_to_single_account(account_id, region, secret_name, secret_value, delete_sync)
 
         except Exception as e:
             print(f"ERROR: Could not process secret {secret_arn}. Error: {e}")
 
-    # Cleanup phase: remove orphaned secrets
+    # Cleanup phase: remove orphaned secrets (only for accounts with DeleteSync enabled)
     for account_id in target_accounts:
-        managed_secrets = managed_secrets_per_account.get(account_id, set())
-        cleanup_orphaned_secrets(account_id, managed_secrets)
+        if delete_sync_per_account.get(account_id, True):
+            managed_secrets = managed_secrets_per_account.get(account_id, set())
+            cleanup_orphaned_secrets(account_id, managed_secrets, never_delete)
+        else:
+            print(f"Skipping cleanup for account {account_id} (DeleteSync disabled)")
 
     return {
         "statusCode": 200,
