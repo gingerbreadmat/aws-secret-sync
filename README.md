@@ -53,13 +53,56 @@ This solution uses a "hub-and-spoke" model for secret management.
 
 In each target account, you must add an IAM role named `SecretSyncRole` that the management account's Lambda can assume.
 
-Instead of deploying a separate stack, we recommend adding this role to your existing Infrastructure as Code (IaC) setup. Below are examples for CloudFormation and Terraform.
+#### **Required IAM Policy**
+
+The role needs the following permissions (replace `YOUR_MANAGEMENT_ACCOUNT_ID` with your actual 12-digit account ID):
+
+**Trust Policy:**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::YOUR_MANAGEMENT_ACCOUNT_ID:role/SecretSyncLambdaRole"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+**Permissions Policy:**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:UpdateSecret", 
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+#### **Recommended Approach**
+
+We strongly recommend adding this role to your existing Infrastructure as Code (IaC) rather than creating it manually. This ensures the role is properly managed, versioned, and documented alongside your other infrastructure.
+
+Choose your IaC tool below for specific implementation examples:
 
 ---
 
-#### **CloudFormation Example**
+#### **CloudFormation**
 
-Add the following `Resource` to your existing CloudFormation template. You will need to pass in the `ManagementAccountId` as a parameter to your stack.
+Add the following to your existing CloudFormation template:
 
 ```yaml
 Parameters:
@@ -95,9 +138,9 @@ Resources:
 
 ---
 
-#### **Terraform Example**
+#### **Terraform**
 
-Add the following resources to your existing Terraform configuration. You will need to provide the `management_account_id` as a variable.
+Add the following to your existing Terraform configuration:
 
 ```hcl
 variable "management_account_id" {
@@ -142,6 +185,116 @@ resource "aws_iam_role_policy" "secret_write_access" {
     ]
   })
 }
+```
+
+---
+
+#### **AWS CDK (TypeScript)**
+
+Add the following to your existing CDK stack:
+
+```typescript
+import { Role, PolicyStatement, Effect, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
+
+const managementAccountId = 'YOUR_MANAGEMENT_ACCOUNT_ID'; // Replace with actual ID
+
+const secretSyncRole = new Role(this, 'SecretSyncRole', {
+  roleName: 'SecretSyncRole',
+  assumedBy: new ServicePrincipal(`arn:aws:iam::${managementAccountId}:role/SecretSyncLambdaRole`),
+});
+
+secretSyncRole.addToPolicy(new PolicyStatement({
+  effect: Effect.ALLOW,
+  actions: [
+    'secretsmanager:CreateSecret',
+    'secretsmanager:UpdateSecret',
+    'secretsmanager:PutSecretValue',
+    'secretsmanager:DescribeSecret'
+  ],
+  resources: ['*']
+}));
+```
+
+---
+
+#### **Pulumi (TypeScript)**
+
+Add the following to your existing Pulumi program:
+
+```typescript
+import * as aws from "@pulumi/aws";
+
+const managementAccountId = 'YOUR_MANAGEMENT_ACCOUNT_ID'; // Replace with actual ID
+
+const secretSyncRole = new aws.iam.Role("secretSyncRole", {
+    name: "SecretSyncRole",
+    assumeRolePolicy: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Principal: {
+                AWS: `arn:aws:iam::${managementAccountId}:role/SecretSyncLambdaRole`
+            },
+            Action: "sts:AssumeRole"
+        }]
+    })
+});
+
+const secretSyncPolicy = new aws.iam.RolePolicy("secretSyncPolicy", {
+    name: "SecretWriteAccess",
+    role: secretSyncRole.id,
+    policy: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Action: [
+                "secretsmanager:CreateSecret",
+                "secretsmanager:UpdateSecret",
+                "secretsmanager:PutSecretValue",
+                "secretsmanager:DescribeSecret"
+            ],
+            Resource: "*"
+        }]
+    })
+});
+```
+
+---
+
+#### **AWS SAM**
+
+Add the following to your existing SAM template:
+
+```yaml
+Parameters:
+  ManagementAccountId:
+    Type: String
+    Description: "The 12-digit AWS Account ID of the Secret Sync management account."
+
+Resources:
+  SecretSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SecretSyncRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${ManagementAccountId}:role/SecretSyncLambdaRole"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: SecretWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "secretsmanager:CreateSecret"
+                  - "secretsmanager:UpdateSecret"
+                  - "secretsmanager:PutSecretValue"
+                  - "secretsmanager:DescribeSecret"
+                Resource: "*"
 ```
 
 ---
