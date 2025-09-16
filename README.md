@@ -22,32 +22,45 @@ This solution uses a "hub-and-spoke" model for secret management.
     *   Deploy the `template.yaml` file located in the `management-account/` directory of this project using the AWS SAM CLI.
     *   This will create the Secret Sync Lambda function and its associated execution role and trigger.
 
-2.  **Create Configuration Secret:**
-    *   In the AWS Secrets Manager console of your management account, create a new secret with the name `secret-sync/config`.
-    *   The content of the secret should be a JSON object defining your account groups.
+2.  **Configuration Setup (Choose Your Path):**
 
-    **Example `secret-sync/config` JSON:**
+#### **Simple Setup - Individual Accounts Only**
 
-    Each key in `AccountGroups` defines a group. The value can be a simple list of account IDs (for same-region syncing) or an object containing an `Accounts` list and an optional `Region`.
+If you only plan to sync secrets to specific individual accounts using `SecretSync-SyncAccount` tags, **no configuration secret is needed**. You can start using the system immediately after deploying the Lambda.
 
-    ```json
-    {
-      "Version": "1.0",
-      "AccountGroups": {
-        "Production-US": {
-          "Accounts": ["111111111111", "222222222222"],
-          "Region": "us-east-1"
-        },
-        "Production-EU": {
-          "Accounts": ["333333333333"],
-          "Region": "eu-west-1"
-        },
-        "Dev-SameRegion": [
-          "444444444444"
-        ]
-      }
-    }
-    ```
+**When to use:** Perfect for simple setups with just a few target accounts.
+
+#### **Advanced Setup - Account Groups**
+
+If you want to use account groups for easier management (using `SecretSync-SyncDestinationGroup` tags), create a configuration secret:
+
+*   In the AWS Secrets Manager console of your management account, create a new secret with the name `secret-sync/config`.
+*   The content should be a JSON object defining your account groups.
+
+**Example `secret-sync/config` JSON:**
+
+Each key in `AccountGroups` defines a group. The value can be a simple list of account IDs (for same-region syncing) or an object containing an `Accounts` list and an optional `Region`.
+
+```json
+{
+  "Version": "1.0",
+  "AccountGroups": {
+    "Production-US": {
+      "Accounts": ["111111111111", "222222222222"],
+      "Region": "us-east-1"
+    },
+    "Production-EU": {
+      "Accounts": ["333333333333"],
+      "Region": "eu-west-1"
+    },
+    "Dev-SameRegion": [
+      "444444444444"
+    ]
+  }
+}
+```
+
+**When to use:** Best for organizations with many accounts or complex regional requirements.
 
 ### **Part 2: Target Account Setup (One-Time)**
 
