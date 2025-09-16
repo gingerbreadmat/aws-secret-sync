@@ -27,12 +27,24 @@ This solution uses a "hub-and-spoke" model for secret management.
     *   The content of the secret should be a JSON object defining your account groups.
 
     **Example `secret-sync/config` JSON:**
+
+    Each key in `AccountGroups` defines a group. The value can be a simple list of account IDs (for same-region syncing) or an object containing an `Accounts` list and an optional `Region`.
+
     ```json
     {
       "Version": "1.0",
       "AccountGroups": {
-        "Production": ["111111111111", "222222222222"],
-        "Development": ["333333333333", "444444444444"]
+        "Production-US": {
+          "Accounts": ["111111111111", "222222222222"],
+          "Region": "us-east-1"
+        },
+        "Production-EU": {
+          "Accounts": ["333333333333"],
+          "Region": "eu-west-1"
+        },
+        "Dev-SameRegion": [
+          "444444444444"
+        ]
       }
     }
     ```
@@ -179,3 +191,11 @@ To sync a secret to the `Development` group and also to a special `Staging` acco
 ### Triggering the Sync
 
 After tagging a secret, the Lambda will process it on its next scheduled run (e.g., once per hour). You can also trigger the Lambda manually in the AWS Console for an immediate sync.
+
+---
+
+## Support
+
+If you find this tool useful, please consider supporting my work!
+
+<a href="https://buymeacoffee.com/gingerbreadmat"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
