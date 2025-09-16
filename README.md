@@ -97,7 +97,8 @@ The role needs the following permissions (replace `YOUR_MANAGEMENT_ACCOUNT_ID` w
         "secretsmanager:CreateSecret",
         "secretsmanager:UpdateSecret", 
         "secretsmanager:PutSecretValue",
-        "secretsmanager:DescribeSecret"
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:TagResource"
       ],
       "Resource": "*"
     }
@@ -146,6 +147,7 @@ Resources:
                   - "secretsmanager:UpdateSecret"
                   - "secretsmanager:PutSecretValue"
                   - "secretsmanager:DescribeSecret"
+                  - "secretsmanager:TagResource"
                 Resource: "*"
 ```
 
@@ -191,7 +193,8 @@ resource "aws_iam_role_policy" "secret_write_access" {
           "secretsmanager:CreateSecret",
           "secretsmanager:UpdateSecret",
           "secretsmanager:PutSecretValue",
-          "secretsmanager:DescribeSecret"
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:TagResource"
         ],
         Resource = "*"
       }
@@ -222,7 +225,8 @@ secretSyncRole.addToPolicy(new PolicyStatement({
     'secretsmanager:CreateSecret',
     'secretsmanager:UpdateSecret',
     'secretsmanager:PutSecretValue',
-    'secretsmanager:DescribeSecret'
+    'secretsmanager:DescribeSecret',
+    'secretsmanager:TagResource'
   ],
   resources: ['*']
 }));
@@ -264,7 +268,8 @@ const secretSyncPolicy = new aws.iam.RolePolicy("secretSyncPolicy", {
                 "secretsmanager:CreateSecret",
                 "secretsmanager:UpdateSecret",
                 "secretsmanager:PutSecretValue",
-                "secretsmanager:DescribeSecret"
+                "secretsmanager:DescribeSecret",
+                "secretsmanager:TagResource"
             ],
             Resource: "*"
         }]
@@ -307,6 +312,7 @@ Resources:
                   - "secretsmanager:UpdateSecret"
                   - "secretsmanager:PutSecretValue"
                   - "secretsmanager:DescribeSecret"
+                  - "secretsmanager:TagResource"
                 Resource: "*"
 ```
 
@@ -317,6 +323,8 @@ Resources:
 Tagging a secret in the management account is how you control where it gets synced. The logic is determined by a combination of four possible tags.
 
 ### Tagging Rules
+
+#### Sync Operations
 
 1.  **Build a "Sync" list:**
     *   `SecretSync-SyncDestinationGroup`: Syncs the secret to all accounts in this group from your config file.
@@ -329,6 +337,7 @@ Tagging a secret in the management account is how you control where it gets sync
 3.  **Final Logic:** The final list of accounts to sync to is (`Sync` list) - (`NoSync` list).
     *   **Exclusion takes priority.** If an account is in both lists, it will be excluded.
     *   The `...Account` tags only support a single account ID. To specify multiple accounts, you must create a group in the `secret-sync/config` file.
+
 
 ### Example Scenarios
 
@@ -353,6 +362,7 @@ To sync a secret to the `Development` group and also to a special `Staging` acco
 *   **Tag 2:**
     *   Key: `SecretSync-SyncAccount`
     *   Value: `987654321098`
+
 
 ### Triggering the Sync
 
