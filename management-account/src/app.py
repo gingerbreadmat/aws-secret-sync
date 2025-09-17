@@ -1,4 +1,3 @@
-
 import json
 import boto3
 import os
@@ -102,10 +101,12 @@ def resolve_sync_targets(tags, config):
     return [(acc, region, delete_sync) for acc, (region, delete_sync) in final_targets.items()]
 
 
-def sync_to_single_account(account_id, region, secret_name, secret_value, delete_sync=True):
-    """Assumes a role in a target account and creates/updates the secret in the specified region."""
+def sync_to_single_account(account_id, region, secret_metadata, delete_sync=True):
+    """Assumes a role in a target account and creates/updates the secret and its metadata."""
+    secret_name = secret_metadata["Name"]
     region_str = region if region else "the default region"
     print(f"  -> Syncing to account {account_id} in {region_str} as secret '{secret_name}'...")
+    
     try:
         assumed_role = sts.assume_role(
             RoleArn=f"arn:aws:iam::{account_id}:role/{ROLE_TO_ASSUME}",
@@ -122,38 +123,79 @@ def sync_to_single_account(account_id, region, secret_name, secret_value, delete
         )
 
         try:
-            secret_info = target_sm_client.describe_secret(SecretId=secret_name)
-            
-            # Check if target secret is marked for deletion
-            if secret_info.get("DeletedDate"):
+            # UPDATE PATH
+            target_secret_info = target_sm_client.describe_secret(SecretId=secret_name)
+            print(f"     Secret '{secret_name}' exists. Updating attributes...")
+
+            # Restore if needed
+            if target_secret_info.get("DeletedDate"):
                 if delete_sync:
                     print(f"     Secret '{secret_name}' is marked for deletion, restoring it first.")
                     target_sm_client.restore_secret(SecretId=secret_name)
-                    print(f"     Restored secret '{secret_name}' from deletion.")
                 else:
                     print(f"     Secret '{secret_name}' is marked for deletion, but DeleteSync is disabled. Skipping sync.")
                     return
+
+            # Sync Description
+            if target_secret_info.get("Description") != secret_metadata.get("Description"):
+                print("     - Updating description.")
+                target_sm_client.update_secret(SecretId=secret_name, Description=secret_metadata.get("Description"))
+
+            # Sync Value
+            print("     - Updating secret value.")
+            value_args = {"SecretId": secret_name}
+            if secret_metadata["ValueType"] == "String":
+                value_args["SecretString"] = secret_metadata["Value"]
+            else:
+                value_args["SecretBinary"] = secret_metadata["Value"]
+            target_sm_client.put_secret_value(**value_args)
+
+            # Sync Tags
+            print("     - Syncing tags.")
+            source_tags = {tag["Key"]: tag["Value"] for tag in secret_metadata.get("Tags", [])}
+            target_tags = {tag["Key"]: tag["Value"] for tag in target_secret_info.get("Tags", [])}
             
-            print(f"     Secret '{secret_name}' exists. Updating value.")
-            target_sm_client.put_secret_value(SecretId=secret_name, SecretString=secret_value)
-            
-            # Add management tag to existing secret
-            target_sm_client.tag_resource(
-                SecretId=secret_info["ARN"],
-                Tags=[{"Key": "SyncedFrom", "Value": MANAGEMENT_ACCOUNT_ID}]
-            )
+            tags_to_add = [{"Key": k, "Value": v} for k, v in source_tags.items() if k not in target_tags or target_tags[k] != v]
+            tags_to_remove = [k for k in target_tags if k not in source_tags and k != "SyncedFrom"]
+
+            if tags_to_add:
+                print(f"       - Adding/updating tags: {[t['Key'] for t in tags_to_add]}")
+                target_sm_client.tag_resource(SecretId=secret_name, Tags=tags_to_add)
+            if tags_to_remove:
+                print(f"       - Removing tags: {tags_to_remove}")
+                target_sm_client.untag_resource(SecretId=secret_name, TagKeys=tags_to_remove)
+
+            # Check KMS Key
+            if target_secret_info.get("KmsKeyId") != secret_metadata.get("KmsKeyId"):
+                print(f"     WARNING: KMS Key mismatch for secret '{secret_name}'. Source key is '{secret_metadata.get('KmsKeyId')}' but target is '{target_secret_info.get('KmsKeyId')}'. KMS keys cannot be changed on existing secrets.")
+
             print(f"     Successfully updated secret '{secret_name}' in account {account_id}.")
+
         except target_sm_client.exceptions.ResourceNotFoundException:
+            # CREATE PATH
             print(f"     Secret '{secret_name}' not found. Creating it.")
-            response = target_sm_client.create_secret(
-                Name=secret_name, 
-                SecretString=secret_value,
-                Tags=[{"Key": "SyncedFrom", "Value": MANAGEMENT_ACCOUNT_ID}]
-            )
+            
+            create_args = {
+                "Name": secret_name,
+                "Description": secret_metadata.get("Description"),
+                "KmsKeyId": secret_metadata.get("KmsKeyId"),
+                "Tags": secret_metadata.get("Tags", []) + [{"Key": "SyncedFrom", "Value": MANAGEMENT_ACCOUNT_ID}]
+            }
+            
+            if secret_metadata["ValueType"] == "String":
+                create_args["SecretString"] = secret_metadata["Value"]
+            else:
+                create_args["SecretBinary"] = secret_metadata["Value"]
+            
+            # Remove None values from args
+            create_args = {k: v for k, v in create_args.items() if v is not None}
+            
+            target_sm_client.create_secret(**create_args)
             print(f"     Successfully created secret '{secret_name}' in account {account_id}.")
 
     except Exception as e:
         print(f"     ERROR: Failed to sync to account {account_id} in region {region}. Error: {e}")
+
 
 def mark_secret_for_deletion(account_id, region, secret_name, source_describe_response, never_delete=False):
     """Mark secret for deletion in target account with same settings as source."""
@@ -276,9 +318,12 @@ def lambda_handler(event, context):
 
     for resource in secrets_to_process:
         secret_arn = resource["ResourceARN"]
-        tags = resource.get("Tags", [])
         
         try:
+            # We get tags from get_resources, but describe_secret is the source of truth
+            describe_response = secretsmanager.describe_secret(SecretId=secret_arn)
+            tags = describe_response.get("Tags", [])
+            
             sync_targets = resolve_sync_targets(tags, config)
 
             if not sync_targets:
@@ -286,38 +331,45 @@ def lambda_handler(event, context):
                 continue
 
             print(f"Processing secret {secret_arn} for {len(sync_targets)} target(s).")
-
-            describe_response = secretsmanager.describe_secret(SecretId=secret_arn)
-            secret_name = describe_response["Name"]
             
+            secret_name = describe_response["Name"]
+
+            # Track managed secrets for cleanup, regardless of deletion state
+            for account_id, region, delete_sync in sync_targets:
+                target_accounts.add(account_id)
+                delete_sync_per_account[account_id] = delete_sync
+                if account_id not in managed_secrets_per_account:
+                    managed_secrets_per_account[account_id] = set()
+                managed_secrets_per_account[account_id].add(secret_name)
+
             # Check if secret is marked for deletion
             if describe_response.get("DeletedDate"):
                 print(f"Secret '{secret_name}' is marked for deletion, syncing deletion state to targets with DeleteSync enabled.")
-                # Track managed secrets for cleanup
                 for account_id, region, delete_sync in sync_targets:
-                    target_accounts.add(account_id)
-                    delete_sync_per_account[account_id] = delete_sync
-                    if account_id not in managed_secrets_per_account:
-                        managed_secrets_per_account[account_id] = set()
-                    managed_secrets_per_account[account_id].add(secret_name)
-                    
                     if delete_sync:
                         mark_secret_for_deletion(account_id, region, secret_name, describe_response, never_delete)
                     else:
                         print(f"     Skipping deletion sync for account {account_id} (DeleteSync disabled)")
             else:
+                # Build the full secret metadata object
                 secret_response = secretsmanager.get_secret_value(SecretId=secret_arn)
-                secret_value = secret_response["SecretString"]
                 
-                # Track managed secrets for cleanup
+                secret_metadata = {
+                    "Name": secret_name,
+                    "Description": describe_response.get("Description"),
+                    "KmsKeyId": describe_response.get("KmsKeyId"),
+                    "Tags": [t for t in tags if t["Key"] not in SYNC_TAG_KEYS]
+                }
+
+                if "SecretString" in secret_response:
+                    secret_metadata["Value"] = secret_response["SecretString"]
+                    secret_metadata["ValueType"] = "String"
+                elif "SecretBinary" in secret_response:
+                    secret_metadata["Value"] = secret_response["SecretBinary"]
+                    secret_metadata["ValueType"] = "Binary"
+
                 for account_id, region, delete_sync in sync_targets:
-                    target_accounts.add(account_id)
-                    delete_sync_per_account[account_id] = delete_sync
-                    if account_id not in managed_secrets_per_account:
-                        managed_secrets_per_account[account_id] = set()
-                    managed_secrets_per_account[account_id].add(secret_name)
-                    
-                    sync_to_single_account(account_id, region, secret_name, secret_value, delete_sync)
+                    sync_to_single_account(account_id, region, secret_metadata, delete_sync)
 
         except Exception as e:
             print(f"ERROR: Could not process secret {secret_arn}. Error: {e}")
